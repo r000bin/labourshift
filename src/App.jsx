@@ -192,7 +192,7 @@ function KPI({ label, value, unit, delta, good }) {
   const isPositive = delta > 0;
   const color = delta === 0 ? C.text : (good ? (isPositive ? C.green : C.red) : (isPositive ? C.red : C.green));
   return (
-    <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, padding: "14px 18px", flex: 1, minWidth: 130 }}>
+    <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, padding: "12px 14px" }}>
       <div style={{ color: C.textDim, fontSize: 10, textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>{label}</div>
       <div style={{ color: C.text, fontSize: 20, fontWeight: 700, fontFamily: "monospace" }}>
         {value}<span style={{ fontSize: 12, color: C.textDim }}> {unit}</span>
@@ -319,17 +319,29 @@ export default function SwissDigitalTwin() {
   return (
     <div style={{
       background: C.bg, minHeight: "100vh", fontFamily: "'IBM Plex Mono', 'Courier New', monospace",
-      color: C.text, padding: "24px",
+      color: C.text, padding: "clamp(12px, 3vw, 24px)",
     }}>
+      <style>{`
+        .main-grid {
+          display: grid;
+          grid-template-columns: 320px 1fr;
+          gap: 20px;
+        }
+        @media (max-width: 768px) {
+          .main-grid {
+            grid-template-columns: 1fr;
+          }
+        }
+      `}</style>
       {/* Header */}
       <div style={{ marginBottom: 24, borderBottom: `1px solid ${C.border}`, paddingBottom: 16 }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap" }}>
           <div style={{ fontSize: 10, color: C.accent, letterSpacing: 3, textTransform: "uppercase" }}>
             ◆ Swiss Digital Twin
           </div>
           <div style={{ fontSize: 10, color: C.textDim }}>/ AI Unemployment Macroeconomic Simulator</div>
         </div>
-        <h1 style={{ margin: "6px 0 4px", fontSize: 22, fontWeight: 700, color: "#fff", letterSpacing: -0.5 }}>
+        <h1 style={{ margin: "6px 0 4px", fontSize: "clamp(16px, 4vw, 22px)", fontWeight: 700, color: "#fff", letterSpacing: -0.5 }}>
           AI Displacement Demand Spiral
         </h1>
         <p style={{ margin: 0, fontSize: 11, color: C.textDim, maxWidth: 600 }}>
@@ -337,7 +349,7 @@ export default function SwissDigitalTwin() {
         </p>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "320px 1fr", gap: 20 }}>
+      <div className="main-grid">
 
         {/* ── Left panel: controls ── */}
         <div>
@@ -454,7 +466,7 @@ export default function SwissDigitalTwin() {
         {/* ── Right panel: charts & KPIs ── */}
         <div>
           {/* KPI bar */}
-          <div style={{ display: "flex", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12, marginBottom: 16 }}>
             <KPI
               label="Unemployment (2039)"
               value={final.unemploymentRate.toFixed(1)}
