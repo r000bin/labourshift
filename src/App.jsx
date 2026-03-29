@@ -51,14 +51,22 @@ const COEFF = {
   ubiLabourElasticity: 0.15,
   // ALV cost per 1pp unemployment (SECO)
   alvCostPerPP: 2.45,         // CHF bn
+  // Okun feedback: how much new unemployment each 1% GDP contraction creates
+  // Standard Swiss Okun is 0.22 (cyclical). Structural shocks are worse:
+  // firms permanently close, not just reduce hours. Use 0.5 for AI shock.
+  okunFeedback: 0.5,
 };
 
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 function fmt(v, d = 1) { return typeof v === 'number' ? v.toFixed(d) : v; }
 
 // ─── Simulation engine: models the demand death spiral ──────────────────────
-// Primary displacement → lost income → consumption drop → GDP contraction
-// → business failures → MORE unemployment → repeat
+// Unemployment is a COMPOUNDING STATE VARIABLE. Each year:
+//   1. AI displaces workers (exogenous shock, ramps over time)
+//   2. Previous spiral-induced unemployment carries forward
+//   3. Total unemployed lose income → consumption drops
+//   4. Consumption crash → GDP contracts → businesses fail → MORE unemployment
+//   5. That new unemployment feeds back into step 3 next year
 //
 // Policy tools break the spiral by maintaining consumption (UBI),
 // redistributing work (hours reduction), reskilling (ALMP), and
@@ -71,107 +79,135 @@ function runSimulation(params, years = 15) {
   } = params;
 
   const data = [];
-  let gdp = SWISS.gdp;
   let debtGDP = SWISS.debtGDP;
   let cumulativeCost = 0;
-  let longTermUnemployed = 0;
+
+  // STATE: spiral-induced unemployment accumulates year over year
+  let spiralUnemp = 0;
+  // STATE: long-term unemployed (subset, harder to re-employ)
+  let longTermShare = 0;
 
   for (let year = 0; year <= years; year++) {
     // ── Step 1: Primary AI displacement (exogenous shock) ───────
-    const primaryDisplacement = year < rampYears
-      ? SWISS.unemploymentBase + (peakDisplacement - SWISS.unemploymentBase) * year / rampYears
-      : peakDisplacement;
+    const aiDisplacement = year < rampYears
+      ? (peakDisplacement - SWISS.unemploymentBase) * year / rampYears
+      : (peakDisplacement - SWISS.unemploymentBase);
 
     // ── Step 2: Work sharing absorbs some displacement ──────────
+    // Elasticity -0.45: 10% fewer hours → 4.5% more jobs (Kapteyn, Hunt)
     const sharedJobs = hoursReduction * COEFF.hoursElasticity;
-    const afterSharing = Math.max(SWISS.unemploymentBase, primaryDisplacement - sharedJobs);
 
-    // ── Step 3: ALMP/retraining reduces unemployment (2-year lag) ─
-    const almLag = year >= 2 ? 1 : year >= 1 ? 0.4 : 0.1;
-    const almEffect = almLag * almSpending * COEFF.almEfficiency / 100;
-    const afterALM = Math.max(SWISS.unemploymentBase, afterSharing - almEffect);
+    // ── Step 3: ALMP/retraining pulls people back (2-year lag) ──
+    const almLag = year >= 3 ? 1 : year >= 2 ? 0.6 : year >= 1 ? 0.2 : 0;
+    const almReduction = almLag * almSpending * COEFF.almEfficiency / 100;
 
-    // ── Step 4: The consumption death spiral ────────────────────
-    const gap = afterALM - SWISS.unemploymentBase;
+    // ── Step 4: Total unemployment = AI shock + spiral carryover - mitigations ─
+    const totalUnempRate = clamp(
+      SWISS.unemploymentBase + aiDisplacement + spiralUnemp - sharedJobs - almReduction,
+      SWISS.unemploymentBase, 0.70
+    );
+    const gap = totalUnempRate - SWISS.unemploymentBase;
     const displacedWorkers = gap * SWISS.workforce;
 
-    // Income lost by displaced workers
+    // ── Step 5: Income loss → consumption crash ─────────────────
     const annualWage = SWISS.medianWage * 12;
-    // ALV covers 75% for 18 months, then nothing
-    // Effective average replacement depends on unemployment duration
-    const alvCoverage = year < 1.5 ? SWISS.alvReplacementRate : SWISS.alvReplacementRate * 0.5;
-    const incomeLostWithoutUBI = displacedWorkers * annualWage * (1 - alvCoverage) / 1e9;
+    // ALV covers 75% but only for 18 months. As unemployment persists,
+    // more people exhaust benefits. Model: coverage decays with long-term share.
+    const alvEffective = SWISS.alvReplacementRate * (1 - longTermShare * 0.8);
+    const grossIncomeLost = displacedWorkers * annualWage / 1e9;
+    const incomeLostAfterALV = grossIncomeLost * (1 - alvEffective);
 
-    // UBI replaces some lost income
+    // UBI replaces some lost income for displaced workers
     const ubiTotalCost = ubiAmount * 12 * SWISS.adults / 1e9;
-    // Net UBI cost after replacing existing transfers (~CHF 15 bn absorbed)
-    const ubiNetCost = Math.max(0, ubiTotalCost - 15);
-    // UBI income going to displaced workers specifically
+    const ubiNetCost = Math.max(0, ubiTotalCost - 15); // absorbs existing transfers
     const ubiForDisplaced = ubiAmount * 12 * displacedWorkers / 1e9;
-    const incomeLostWithUBI = Math.max(0, incomeLostWithoutUBI - ubiForDisplaced);
+    const netIncomeLost = Math.max(0, incomeLostAfterALV - ubiForDisplaced);
 
-    // Consumption drop from displaced workers
-    const consumptionLoss = incomeLostWithUBI * COEFF.mpcUnemployed;
+    // Consumption crash: displaced workers have high MPC (0.85)
+    const consumptionLoss = netIncomeLost * COEFF.mpcUnemployed;
 
-    // GDP contraction from consumption loss
-    const consumptionGDPHit = consumptionLoss / SWISS.gdp;
+    // Employed workers also cut spending from fear/uncertainty (confidence channel)
+    const fearMultiplier = 1 + clamp(gap * 0.5, 0, 0.3); // up to 30% amplification
+    const totalConsumptionLoss = consumptionLoss * fearMultiplier;
 
-    // ── Step 5: Business failure cascade ────────────────────────
-    const cascadeHit = consumptionGDPHit * COEFF.cascadeAmplifier;
+    // ── Step 6: GDP contraction ─────────────────────────────────
+    const consumptionGDPHit = totalConsumptionLoss / SWISS.gdp;
 
-    // ── Step 6: CHF appreciation (safe-haven, global AI shock) ──
-    const chfHit = year < rampYears
-      ? COEFF.chfAppreciation * COEFF.exportElasticity * SWISS.exportShare * (year / rampYears)
-      : COEFF.chfAppreciation * COEFF.exportElasticity * SWISS.exportShare;
+    // Business failure cascade: 25% amplification (Bilbiie, Ghironi & Melitz)
+    // Accelerates past 10% unemployment (credit tightening threshold)
+    const cascadeRate = gap > 0.10
+      ? COEFF.cascadeAmplifier * 1.5
+      : COEFF.cascadeAmplifier;
+    const cascadeHit = consumptionGDPHit * cascadeRate;
 
-    // ── Step 7: Total GDP impact ────────────────────────────────
+    // CHF safe-haven appreciation hurts exports
+    const chfHit = COEFF.chfAppreciation * COEFF.exportElasticity * SWISS.exportShare
+      * Math.min(1, year / Math.max(1, rampYears));
+
+    // Total GDP impact
     const totalGDPHit = consumptionGDPHit + cascadeHit + chfHit;
-    const gdpFactor = Math.max(0.55, 1 - totalGDPHit);
-    gdp = SWISS.gdp * gdpFactor;
+    const gdpFactor = clamp(1 - totalGDPHit, 0.40, 1.0);
+    const gdp = SWISS.gdp * gdpFactor;
 
-    // ── Step 8: Second-round unemployment from GDP contraction ──
-    // Businesses close → more people lose jobs
-    const secondRoundUnemp = (cascadeHit + chfHit) * 0.22; // Okun inverse
-    const spiralUnemp = clamp(afterALM + secondRoundUnemp, SWISS.unemploymentBase, 0.50);
+    // ── Step 7: THE SPIRAL — GDP contraction creates NEW unemployment ─
+    // Okun's Law inverse: 1% GDP decline → ~0.5pp unemployment (structural shock)
+    // Standard Okun is 0.22 for Switzerland cyclically, but structural shocks
+    // are worse because firms permanently close, not just reduce hours.
+    // We use the FULL GDP hit (consumption + cascade + CHF), not just cascade.
+    const newSpiralUnemp = totalGDPHit * COEFF.okunFeedback;
 
-    // ── Step 9: Hysteresis — long-term unemployment trap ────────
+    // ── Step 8: Hysteresis — long-term unemployment trap ────────
+    // Each year of unemployment, skills depreciate (4%/yr, NBER/LSE),
+    // callback rates drop 50% after 12 months (audit studies).
+    // This makes the spiral "sticky" — even if the shock eases, damage persists.
     if (year > 0) {
-      longTermUnemployed = Math.min(
-        gap * 0.6,
-        longTermUnemployed * (1 + COEFF.hysteresisRate) + gap * 0.15
+      longTermShare = clamp(
+        longTermShare * 0.92 + gap * 0.18, // 18% of unemployed become long-term each year
+        0, 0.65
       );
     }
+    // Hysteresis adds unemployment: long-term unemployed block recovery
+    const hysteresisUnemp = longTermShare * COEFF.hysteresisRate * 2;
+
+    // ── Step 9: Update spiral state for NEXT year ───────────────
+    // New spiral unemployment = demand-driven + hysteresis
+    // Decays 20% per year naturally (some adaptation) but new damage accumulates
+    spiralUnemp = clamp(
+      spiralUnemp * 0.80 + newSpiralUnemp + hysteresisUnemp,
+      0, 0.40
+    );
 
     // ── Step 10: Fiscal accounting ──────────────────────────────
     const taxRevenue = SWISS.taxRevenue * Math.pow(gdpFactor, COEFF.taxElasticity);
-    const aiTaxRevenue = aiRevenue + (corporateTaxRate / 100) * gdp * 0.15; // 15% of GDP is corporate profits
+    const aiTaxRevenue = aiRevenue + (corporateTaxRate / 100) * gdp * 0.15;
     const alvCost = gap * 100 * COEFF.alvCostPerPP;
-    const hoursCost = SWISS.gdp * 0.005 * hoursReduction * 100; // Kurzarbeit-style subsidy
+    const hoursCost = SWISS.gdp * 0.005 * hoursReduction * 100;
     const policyCost = ubiNetCost + almSpending + hoursCost;
     const totalRevenue = taxRevenue + aiTaxRevenue;
     const totalSpending = SWISS.govtSpendingGDP * gdp + alvCost + policyCost;
     const fiscalBalance = totalRevenue - totalSpending;
     cumulativeCost += policyCost + alvCost;
-    debtGDP = clamp(debtGDP - fiscalBalance / gdp, 0.10, 2.0);
+    debtGDP = clamp(debtGDP - fiscalBalance / gdp, 0.10, 3.0);
 
     // ── Step 11: Consumption level (CHF bn) ─────────────────────
     const baselineConsumption = SWISS.gdp * SWISS.consumptionShare;
-    const actualConsumption = gdp * SWISS.consumptionShare + ubiTotalCost * COEFF.mpcTransfer * 0.3;
+    const actualConsumption = gdp * SWISS.consumptionShare
+      + ubiTotalCost * COEFF.mpcTransfer * 0.4;
 
     // ── Compile ─────────────────────────────────────────────────
     data.push({
       year: 2025 + year,
       // Unemployment breakdown
-      primaryUnemp: +(primaryDisplacement * 100).toFixed(1),
-      effectiveUnemp: +(spiralUnemp * 100).toFixed(1),
-      spiralUnemp: +(secondRoundUnemp * 100).toFixed(1),
-      longTermUnemp: +(longTermUnemployed * 100).toFixed(1),
+      primaryUnemp: +((SWISS.unemploymentBase + aiDisplacement) * 100).toFixed(1),
+      effectiveUnemp: +(totalUnempRate * 100).toFixed(1),
+      spiralAdded: +(spiralUnemp * 100).toFixed(1),
+      longTermUnemp: +(longTermShare * 100).toFixed(1),
       // Economic metrics
       gdp: +gdp.toFixed(1),
       gdpChange: +((gdpFactor - 1) * 100).toFixed(1),
       consumption: +actualConsumption.toFixed(1),
       consumptionBaseline: +baselineConsumption.toFixed(1),
-      consumptionLoss: +consumptionLoss.toFixed(1),
+      consumptionLoss: +totalConsumptionLoss.toFixed(1),
       // Fiscal
       taxRevenue: +totalRevenue.toFixed(1),
       fiscalBalance: +fiscalBalance.toFixed(1),
@@ -180,8 +216,8 @@ function runSimulation(params, years = 15) {
       alvCost: +alvCost.toFixed(1),
       cumulativeCost: +cumulativeCost.toFixed(1),
       // Income
-      incomeLost: +incomeLostWithoutUBI.toFixed(1),
-      incomeReplaced: +(incomeLostWithoutUBI - incomeLostWithUBI).toFixed(1),
+      incomeLost: +grossIncomeLost.toFixed(1),
+      incomeReplaced: +(grossIncomeLost - netIncomeLost).toFixed(1),
       displacedK: Math.round(displacedWorkers / 1000),
     });
   }
@@ -263,7 +299,7 @@ function SpiralDiagram({ data }) {
     { label: "Lost Income", value: `CHF ${d.incomeLost} bn/yr`, color: C.orange },
     { label: "Consumption Crash", value: `CHF −${d.consumptionLoss} bn`, color: C.red },
     { label: "GDP Contraction", value: `${d.gdpChange}%`, color: C.red },
-    { label: "Business Failures", value: `+${d.spiralUnemp.toFixed(1)}pp more unemployed`, color: C.purple },
+    { label: "Business Failures", value: `+${d.spiralAdded.toFixed(1)}pp more unemployed`, color: C.purple },
     { label: "Tax Revenue Falls", value: `CHF ${d.taxRevenue} bn (was ${SWISS.taxRevenue})`, color: C.orange },
   ];
   return (
